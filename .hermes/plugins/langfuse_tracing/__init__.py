@@ -115,7 +115,19 @@ def _truncate_text(value: str, max_chars: int) -> str:
     return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
 
 
-def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0) -> Any:
+def _maybe_parse_json_string(value: str) -> Any:
+    stripped = value.strip()
+    if len(stripped) < 2 or stripped[0] not in "{[" or stripped[-1] not in "}]":
+        return value
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return value
+    return parsed if isinstance(parsed, (dict, list)) else value
+
+
+def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
+                parse_json_strings: bool = False) -> Any:
     max_chars = max_chars if max_chars is not None else int(_env("HERMES_LANGFUSE_MAX_CHARS", "12000") or "12000")
     if depth > 4:
         return "<max-depth>"
@@ -124,16 +136,23 @@ def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0) 
     if isinstance(value, bytes):
         return {"type": "bytes", "len": len(value)}
     if isinstance(value, str):
+        if parse_json_strings:
+            parsed = _maybe_parse_json_string(value)
+            if parsed is not value:
+                return _safe_value(parsed, max_chars=max_chars, depth=depth, parse_json_strings=True)
         return _truncate_text(value, max_chars)
     if isinstance(value, dict):
         return {
-            str(k): _safe_value(v, max_chars=max_chars, depth=depth + 1)
+            str(k): _safe_value(v, max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
             for k, v in list(value.items())[:50]
         }
     if isinstance(value, (list, tuple, set)):
-        return [_safe_value(v, max_chars=max_chars, depth=depth + 1) for v in list(value)[:50]]
+        return [
+            _safe_value(v, max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
+            for v in list(value)[:50]
+        ]
     if hasattr(value, "__dict__"):
-        return _safe_value(vars(value), max_chars=max_chars, depth=depth + 1)
+        return _safe_value(vars(value), max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
     return _truncate_text(repr(value), max_chars)
 
 
@@ -156,12 +175,18 @@ def _serialize_messages(messages: Any) -> list[dict[str, Any]]:
     for message in messages[-12:]:
         if not isinstance(message, dict):
             continue
+        role = message.get("role")
         item = {
-            "role": message.get("role"),
-            "content": _safe_value(message.get("content")),
+            "role": role,
+            "content": _safe_value(
+                message.get("content"),
+                parse_json_strings=(role == "tool"),
+            ),
         }
+        if role == "tool" and message.get("tool_call_id"):
+            item["tool_call_id"] = message.get("tool_call_id")
         if message.get("tool_calls"):
-            item["tool_calls"] = _safe_value(message.get("tool_calls"))
+            item["tool_calls"] = _safe_value(message.get("tool_calls"), parse_json_strings=True)
         serialized.append(item)
     return serialized
 
@@ -182,7 +207,7 @@ def _serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
         serialized.append({
             "id": getattr(tool_call, "id", None),
             "name": name,
-            "arguments": _safe_value(arguments),
+            "arguments": _safe_value(arguments, parse_json_strings=True),
         })
     return serialized
 
@@ -494,8 +519,8 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
 
     _end_observation(
         observation,
-        output=_safe_value(result_value),
-        metadata={"tool_name": tool_name, "args": _safe_value(args)},
+        output=_safe_value(result_value, parse_json_strings=True),
+        metadata={"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
     )
 
 

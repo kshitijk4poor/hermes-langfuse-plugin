@@ -118,12 +118,27 @@ def _truncate_text(value: str, max_chars: int) -> str:
 def _maybe_parse_json_string(value: str) -> Any:
     stripped = value.strip()
     if len(stripped) < 2 or stripped[0] not in "{[" or stripped[-1] not in "}]":
-        return value
+        if len(stripped) < 2 or stripped[0] not in "{[":
+            return value
     try:
-        parsed = json.loads(stripped)
+        parsed, idx = json.JSONDecoder().raw_decode(stripped)
     except Exception:
         return value
-    return parsed if isinstance(parsed, (dict, list)) else value
+    if not isinstance(parsed, (dict, list)):
+        return value
+
+    trailing = stripped[idx:].strip()
+    if not trailing:
+        return parsed
+
+    hint_key = "_hint" if trailing.startswith("[Hint:") else "_trailing_text"
+    if isinstance(parsed, dict):
+        merged = dict(parsed)
+        key = hint_key if hint_key not in merged else "_trailing_text"
+        merged[key] = trailing
+        return merged
+
+    return {"data": parsed, hint_key: trailing}
 
 
 def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
@@ -507,10 +522,7 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
         return
 
     if isinstance(result, str):
-        try:
-            result_value = json.loads(result)
-        except Exception:
-            result_value = result
+        result_value = _maybe_parse_json_string(result)
     else:
         result_value = result
 

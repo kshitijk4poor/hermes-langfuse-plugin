@@ -58,6 +58,21 @@ def test_safe_value_parses_nested_json_strings_when_enabled():
     assert parsed["plain"] == "hello"
 
 
+def test_safe_value_parses_json_with_trailing_hint_text():
+    plugin = _load_plugin_module()
+
+    value = (
+        '{"total_count": 179, "truncated": true}\n\n'
+        "[Hint: Results truncated. Use offset=20 to see more.]"
+    )
+
+    parsed = plugin._safe_value(value, parse_json_strings=True)
+
+    assert parsed["total_count"] == 179
+    assert parsed["truncated"] is True
+    assert parsed["_hint"] == "[Hint: Results truncated. Use offset=20 to see more.]"
+
+
 def test_start_child_observation_uses_parent_observation_api():
     plugin = _load_plugin_module()
 
@@ -94,3 +109,37 @@ def test_start_child_observation_uses_parent_observation_api():
     assert events[0][1]["as_type"] == "generation"
     assert events[0][1]["input"] == {"role": "user", "content": "hi"}
     assert events[0][1]["metadata"] == {"provider": "openai"}
+
+
+def test_on_post_tool_call_parses_json_with_trailing_hint():
+    plugin = _load_plugin_module()
+    updates = {}
+
+    class FakeObservation:
+        def update(self, **kwargs):
+            updates.update(kwargs)
+
+        def end(self):
+            updates["ended"] = True
+
+    task_id = "task-hint"
+    state = plugin.TraceState(trace_id="trace-hint", root_ctx=None, root_span=object())
+    state.tools["call_hint"] = FakeObservation()
+    plugin._TRACE_STATE[task_id] = state
+
+    try:
+        plugin.on_post_tool_call(
+            task_id=task_id,
+            tool_name="search_files",
+            tool_call_id="call_hint",
+            args={"pattern": "provider"},
+            result='{"total_count": 179, "truncated": true}\n\n[Hint: Results truncated. Use offset=20 to see more.]',
+        )
+    finally:
+        plugin._TRACE_STATE.pop(task_id, None)
+
+    assert updates["output"]["total_count"] == 179
+    assert updates["output"]["truncated"] is True
+    assert updates["output"]["_hint"] == "[Hint: Results truncated. Use offset=20 to see more.]"
+    assert updates["metadata"]["tool_name"] == "search_files"
+    assert updates["ended"] is True

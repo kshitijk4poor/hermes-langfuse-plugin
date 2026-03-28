@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,9 @@ class TraceState:
 _STATE_LOCK = threading.Lock()
 _TRACE_STATE: Dict[str, TraceState] = {}
 _LANGFUSE_CLIENT = None
+_READ_FILE_LINE_RE = re.compile(r"^\s*(\d+)\|(.*)$")
+_READ_FILE_HEAD_LINES = 25
+_READ_FILE_TAIL_LINES = 15
 
 
 def _env(name: str, default: str = "") -> str:
@@ -141,6 +145,108 @@ def _maybe_parse_json_string(value: str) -> Any:
     return {"data": parsed, hint_key: trailing}
 
 
+def _looks_like_read_file_payload(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    content = value.get("content")
+    return (
+        isinstance(content, str)
+        and "total_lines" in value
+        and "file_size" in value
+        and "is_binary" in value
+        and "is_image" in value
+        and not value.get("error")
+    )
+
+
+def _parse_read_file_lines(content: str) -> list[dict[str, Any]]:
+    if not isinstance(content, str) or not content:
+        return []
+
+    lines = []
+    for raw_line in content.splitlines():
+        match = _READ_FILE_LINE_RE.match(raw_line)
+        if not match:
+            return []
+        lines.append({
+            "line": int(match.group(1)),
+            "text": match.group(2),
+        })
+    return lines
+
+
+def _build_read_file_preview(lines: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(lines) <= (_READ_FILE_HEAD_LINES + _READ_FILE_TAIL_LINES):
+        return {"lines": lines}
+
+    return {
+        "head": lines[:_READ_FILE_HEAD_LINES],
+        "tail": lines[-_READ_FILE_TAIL_LINES:],
+        "omitted_line_count": len(lines) - _READ_FILE_HEAD_LINES - _READ_FILE_TAIL_LINES,
+    }
+
+
+def _normalize_read_file_payload(value: dict[str, Any], *, args: Any = None) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    if isinstance(args, dict):
+        path = args.get("path")
+        offset = args.get("offset")
+        limit = args.get("limit")
+        if isinstance(path, str) and path:
+            normalized["path"] = path
+        if isinstance(offset, int):
+            normalized["offset"] = offset
+        if isinstance(limit, int):
+            normalized["limit"] = limit
+
+    lines = _parse_read_file_lines(value.get("content", ""))
+    if lines:
+        normalized["returned_lines"] = {
+            "start": lines[0]["line"],
+            "end": lines[-1]["line"],
+            "count": len(lines),
+        }
+        normalized["content_preview"] = _build_read_file_preview(lines)
+    elif value.get("content"):
+        normalized["content_preview"] = {
+            "text": value.get("content", ""),
+        }
+
+    for key in (
+        "total_lines",
+        "file_size",
+        "truncated",
+        "is_binary",
+        "is_image",
+        "hint",
+        "_warning",
+        "mime_type",
+        "dimensions",
+        "similar_files",
+        "error",
+    ):
+        if key in value:
+            normalized[key] = value[key]
+
+    base64_content = value.get("base64_content")
+    if isinstance(base64_content, str) and base64_content:
+        normalized["base64_content"] = {
+            "omitted": True,
+            "length": len(base64_content),
+        }
+
+    return normalized
+
+
+def _normalize_payload(value: Any, *, tool_name: str = "", args: Any = None) -> Any:
+    if _looks_like_read_file_payload(value):
+        return _normalize_read_file_payload(
+            value,
+            args=args if tool_name == "read_file" else None,
+        )
+    return value
+
+
 def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
                 parse_json_strings: bool = False) -> Any:
     max_chars = max_chars if max_chars is not None else int(_env("HERMES_LANGFUSE_MAX_CHARS", "12000") or "12000")
@@ -157,6 +263,9 @@ def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
                 return _safe_value(parsed, max_chars=max_chars, depth=depth, parse_json_strings=True)
         return _truncate_text(value, max_chars)
     if isinstance(value, dict):
+        normalized = _normalize_payload(value)
+        if normalized is not value:
+            return _safe_value(normalized, max_chars=max_chars, depth=depth, parse_json_strings=parse_json_strings)
         return {
             str(k): _safe_value(v, max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
             for k, v in list(value.items())[:50]
@@ -525,6 +634,7 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
         result_value = _maybe_parse_json_string(result)
     else:
         result_value = result
+    result_value = _normalize_payload(result_value, tool_name=tool_name, args=args)
 
     _end_observation(
         observation,

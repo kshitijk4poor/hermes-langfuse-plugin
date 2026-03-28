@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -142,4 +143,80 @@ def test_on_post_tool_call_parses_json_with_trailing_hint():
     assert updates["output"]["truncated"] is True
     assert updates["output"]["_hint"] == "[Hint: Results truncated. Use offset=20 to see more.]"
     assert updates["metadata"]["tool_name"] == "search_files"
+    assert updates["ended"] is True
+
+
+def test_safe_value_formats_read_file_payload_as_preview():
+    plugin = _load_plugin_module()
+
+    content = "\n".join(
+        [
+            "     1|alpha",
+            "     2|beta",
+            "     3|gamma",
+        ]
+    )
+    value = {
+        "content": content,
+        "total_lines": 3,
+        "file_size": 17,
+        "truncated": False,
+        "is_binary": False,
+        "is_image": False,
+    }
+
+    parsed = plugin._safe_value(value, parse_json_strings=True)
+
+    assert "content" not in parsed
+    assert parsed["returned_lines"] == {"start": 1, "end": 3, "count": 3}
+    assert parsed["content_preview"]["lines"][0] == {"line": 1, "text": "alpha"}
+    assert parsed["content_preview"]["lines"][2] == {"line": 3, "text": "gamma"}
+
+
+def test_on_post_tool_call_formats_read_file_output_with_preview_and_args():
+    plugin = _load_plugin_module()
+    updates = {}
+
+    class FakeObservation:
+        def update(self, **kwargs):
+            updates.update(kwargs)
+
+        def end(self):
+            updates["ended"] = True
+
+    task_id = "task-read-file"
+    state = plugin.TraceState(trace_id="trace-read-file", root_ctx=None, root_span=object())
+    state.tools["call_read_file"] = FakeObservation()
+    plugin._TRACE_STATE[task_id] = state
+
+    lines = [f"{line:6d}|line {line}" for line in range(1, 51)]
+    result = json.dumps({
+        "content": "\n".join(lines),
+        "total_lines": 50,
+        "file_size": 400,
+        "truncated": False,
+        "is_binary": False,
+        "is_image": False,
+    })
+
+    try:
+        plugin.on_post_tool_call(
+            task_id=task_id,
+            tool_name="read_file",
+            tool_call_id="call_read_file",
+            args={"path": "agent/models_dev.py", "offset": 1, "limit": 260},
+            result=result,
+        )
+    finally:
+        plugin._TRACE_STATE.pop(task_id, None)
+
+    assert updates["output"]["path"] == "agent/models_dev.py"
+    assert updates["output"]["offset"] == 1
+    assert updates["output"]["limit"] == 260
+    assert updates["output"]["returned_lines"] == {"start": 1, "end": 50, "count": 50}
+    assert updates["output"]["content_preview"]["head"][0] == {"line": 1, "text": "line 1"}
+    assert updates["output"]["content_preview"]["tail"][-1] == {"line": 50, "text": "line 50"}
+    assert updates["output"]["content_preview"]["omitted_line_count"] == 10
+    assert "content" not in updates["output"]
+    assert updates["metadata"]["tool_name"] == "read_file"
     assert updates["ended"] is True

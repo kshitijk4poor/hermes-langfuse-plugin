@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _load_plugin_module():
@@ -220,3 +221,107 @@ def test_on_post_tool_call_formats_read_file_output_with_preview_and_args():
     assert "content" not in updates["output"]
     assert updates["metadata"]["tool_name"] == "read_file"
     assert updates["ended"] is True
+
+
+def test_on_post_llm_call_collects_tool_calls_for_root_trace():
+    plugin = _load_plugin_module()
+
+    class FakeGeneration:
+        def update(self, **kwargs):
+            pass
+
+        def end(self):
+            pass
+
+    task_id = "task-root-tools"
+    state = plugin.TraceState(trace_id="trace-root-tools", root_ctx=None, root_span=object())
+    state.generations["1"] = FakeGeneration()
+    plugin._TRACE_STATE[task_id] = state
+    original_get_langfuse = plugin._get_langfuse
+    plugin._get_langfuse = lambda: object()
+
+    assistant_message = SimpleNamespace(
+        content="",
+        reasoning=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="call_1",
+                function=SimpleNamespace(
+                    name="search_files",
+                    arguments='{"pattern":"provider","path":"."}',
+                ),
+            ),
+        ],
+    )
+
+    try:
+        plugin.on_post_llm_call(
+            task_id=task_id,
+            api_call_count=1,
+            assistant_message=assistant_message,
+            response=None,
+            provider="openai",
+            base_url="",
+            api_mode="chat_completions",
+            model="gpt-5.4",
+        )
+        turn_tool_calls = plugin._TRACE_STATE[task_id].turn_tool_calls
+    finally:
+        plugin._get_langfuse = original_get_langfuse
+        plugin._TRACE_STATE.pop(task_id, None)
+
+    assert turn_tool_calls == [
+        {
+            "id": "call_1",
+            "name": "search_files",
+            "arguments": {"pattern": "provider", "path": "."},
+        }
+    ]
+
+
+def test_finish_trace_merges_aggregated_tool_calls_into_root_output():
+    plugin = _load_plugin_module()
+
+    root_updates = {}
+
+    class FakeRootSpan:
+        def set_trace_io(self, **kwargs):
+            root_updates["trace_io"] = kwargs
+
+        def update(self, **kwargs):
+            root_updates["update"] = kwargs
+
+        def end(self):
+            root_updates["ended"] = True
+
+    class FakeClient:
+        def flush(self):
+            root_updates["flushed"] = True
+
+    task_id = "task-finish-tools"
+    state = plugin.TraceState(trace_id="trace-finish-tools", root_ctx=None, root_span=FakeRootSpan())
+    state.turn_tool_calls.extend(
+        [
+            {"id": "call_1", "name": "search_files", "arguments": {"pattern": "models", "path": "."}},
+            {"id": "call_2", "name": "read_file", "arguments": {"path": "agent/models_dev.py", "offset": 1, "limit": 260}},
+        ]
+    )
+    plugin._TRACE_STATE[task_id] = state
+
+    original_get_langfuse = plugin._get_langfuse
+    plugin._get_langfuse = lambda: FakeClient()
+
+    try:
+        plugin._finish_trace(
+            task_id,
+            output={"content": "final answer", "reasoning": None, "tool_calls": []},
+        )
+    finally:
+        plugin._get_langfuse = original_get_langfuse
+        plugin._TRACE_STATE.pop(task_id, None)
+
+    assert root_updates["trace_io"]["output"]["content"] == "final answer"
+    assert root_updates["trace_io"]["output"]["tool_calls"] == state.turn_tool_calls
+    assert root_updates["update"]["output"]["tool_calls"] == state.turn_tool_calls
+    assert root_updates["ended"] is True
+    assert root_updates["flushed"] is True

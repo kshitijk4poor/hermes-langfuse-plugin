@@ -25,6 +25,7 @@ class TraceState:
     root_span: Any
     generations: Dict[str, Any] = field(default_factory=dict)
     tools: Dict[str, Any] = field(default_factory=dict)
+    turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     last_updated_at: float = field(default_factory=time.time)
 
 
@@ -472,6 +473,15 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
         _debug(f"end observation failed: {exc}")
 
 
+def _merge_trace_output(output: Any, state: TraceState) -> Any:
+    if not state.turn_tool_calls:
+        return output
+
+    merged = dict(output) if isinstance(output, dict) else {"content": output}
+    merged["tool_calls"] = list(state.turn_tool_calls)
+    return merged
+
+
 def _finish_trace(task_key: str, *, output: Any = None) -> None:
     client = _get_langfuse()
     if client is None:
@@ -487,9 +497,10 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             _end_observation(observation)
         for observation in state.tools.values():
             _end_observation(observation)
-        if output is not None:
-            state.root_span.set_trace_io(output=output)
-            state.root_span.update(output=output)
+        final_output = _merge_trace_output(output, state)
+        if final_output is not None:
+            state.root_span.set_trace_io(output=final_output)
+            state.root_span.update(output=final_output)
         state.root_span.end()
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
@@ -571,6 +582,8 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         return
 
     output = _serialize_assistant_message(assistant_message)
+    if output.get("tool_calls"):
+        state.turn_tool_calls.extend(output["tool_calls"])
     usage_details, cost_details = _usage_and_cost(
         response,
         provider=provider,

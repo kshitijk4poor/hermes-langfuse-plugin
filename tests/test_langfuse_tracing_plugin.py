@@ -56,3 +56,41 @@ def test_safe_value_parses_nested_json_strings_when_enabled():
     assert parsed["outer"]["items"][0]["name"] == "alpha"
     assert parsed["outer"]["count"] == 1
     assert parsed["plain"] == "hello"
+
+
+def test_start_child_observation_uses_parent_observation_api():
+    plugin = _load_plugin_module()
+
+    events = []
+
+    class FakeRootSpan:
+        def start_observation(self, **kwargs):
+            events.append(("root_start", kwargs))
+            return {"label": "child"}
+
+    class FakeClient:
+        pass
+
+    state = plugin.TraceState(
+        trace_id="trace-123",
+        root_ctx=None,
+        root_span=FakeRootSpan(),
+    )
+
+    observation = plugin._start_child_observation(
+        state,
+        client=FakeClient(),
+        name="LLM call 1",
+        as_type="generation",
+        input_value={"role": "user", "content": "hi"},
+        metadata={"provider": "openai"},
+        model="gpt-5.4",
+        model_parameters={"provider": "openai"},
+    )
+
+    assert observation["label"] == "child"
+    assert events[0][0] == "root_start"
+    assert events[0][1]["name"] == "LLM call 1"
+    assert events[0][1]["as_type"] == "generation"
+    assert events[0][1]["input"] == {"role": "user", "content": "hi"}
+    assert events[0][1]["metadata"] == {"provider": "openai"}

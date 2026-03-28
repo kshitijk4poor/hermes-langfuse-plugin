@@ -317,17 +317,14 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
                              input_value: Any, metadata: Optional[dict] = None,
                              model: Optional[str] = None, model_parameters: Optional[dict] = None) -> Any:
-    child_ctx = client.start_as_current_observation(
-        trace_context={"trace_id": state.trace_id, "parent_span_id": state.root_span.id},
+    return state.root_span.start_observation(
         name=name,
         as_type=as_type,
         input=input_value,
         metadata=metadata or {},
         model=model,
         model_parameters=model_parameters,
-        end_on_exit=False,
     )
-    return child_ctx.__enter__()
 
 
 def _end_observation(observation: Any, *, output: Any = None, metadata: Optional[dict] = None,

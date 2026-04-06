@@ -386,12 +386,16 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     metadata = {
         "source": "hermes",
         "task_id": task_id,
-        "session_id": session_id,
         "platform": platform,
         "provider": provider,
         "model": model,
         "api_mode": api_mode,
     }
+
+    # session_id must be passed in trace_context for Langfuse session grouping.
+    trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
+    if session_id:
+        trace_ctx["session_id"] = session_id
 
     if propagate_attributes is not None:
         try:
@@ -401,7 +405,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
                 tags=["hermes", "langfuse"],
             ):
                 root_ctx = client.start_as_current_observation(
-                    trace_context={"trace_id": trace_id},
+                    trace_context=trace_ctx,
                     name="Hermes turn",
                     as_type="chain",
                     input=trace_input,
@@ -411,7 +415,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
                 root_span = root_ctx.__enter__()
         except Exception:
             root_ctx = client.start_as_current_observation(
-                trace_context={"trace_id": trace_id},
+                trace_context=trace_ctx,
                 name="Hermes turn",
                 as_type="chain",
                 input=trace_input,
@@ -421,7 +425,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
             root_span = root_ctx.__enter__()
     else:
         root_ctx = client.start_as_current_observation(
-            trace_context={"trace_id": trace_id},
+            trace_context=trace_ctx,
             name="Hermes turn",
             as_type="chain",
             input=trace_input,
@@ -521,7 +525,11 @@ def _request_key(api_call_count: Any) -> str:
 
 def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = "", model: str = "",
                     provider: str = "", base_url: str = "", api_mode: str = "",
-                    api_call_count: int = 0, messages: Any = None, **_: Any) -> None:
+                    api_call_count: int = 0, messages: Any = None,
+                    conversation_history: Any = None, **_: Any) -> None:
+    # pre_api_request passes no messages; pre_llm_call passes conversation_history.
+    if messages is None and conversation_history is not None:
+        messages = conversation_history
     client = _get_langfuse()
     if client is None:
         return
@@ -567,7 +575,8 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
 
 def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str = "", base_url: str = "",
                      api_mode: str = "", model: str = "", api_call_count: int = 0,
-                     assistant_message: Any = None, response: Any = None, **_: Any) -> None:
+                     assistant_message: Any = None, response: Any = None,
+                     api_duration: float = 0.0, finish_reason: str = "", **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
         return
@@ -591,24 +600,30 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         model=model,
         base_url=base_url,
     )
+    gen_metadata: Dict[str, Any] = {"tool_call_count": len(output.get("tool_calls", []))}
+    if api_duration and api_duration > 0:
+        gen_metadata["api_duration_s"] = round(api_duration, 3)
+    if finish_reason:
+        gen_metadata["finish_reason"] = finish_reason
     _end_observation(
         generation,
         output=output,
         usage_details=usage_details,
         cost_details=cost_details,
-        metadata={"tool_call_count": len(output.get("tool_calls", []))},
+        metadata=gen_metadata,
     )
 
     if not _assistant_has_tool_calls(assistant_message) and output.get("content"):
         _finish_trace(task_key, output=output)
 
 
-def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "", tool_call_id: str = "", **_: Any) -> None:
+def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
+                     session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
         return
 
-    task_key = _trace_key(task_id, "")
+    task_key = _trace_key(task_id, session_id)
     tool_key = tool_call_id or f"{tool_name}:{time.time_ns()}"
 
     with _STATE_LOCK:
@@ -626,8 +641,8 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
 
 
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
-                      task_id: str = "", tool_call_id: str = "", **_: Any) -> None:
-    task_key = _trace_key(task_id, "")
+                      task_id: str = "", session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
+    task_key = _trace_key(task_id, session_id)
     tool_key = tool_call_id or ""
     observation = None
 
@@ -657,6 +672,11 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
 
 
 def register(ctx) -> None:
+    # Register for both hook name variants so the plugin works across
+    # Hermes versions.  pre_api_request / post_api_request fire per API
+    # call (preferred); pre_llm_call / post_llm_call fire once per turn.
+    ctx.register_hook("pre_api_request", on_pre_llm_call)
+    ctx.register_hook("post_api_request", on_post_llm_call)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
